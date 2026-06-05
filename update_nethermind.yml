@@ -1,0 +1,135 @@
+---
+- name: Update Nethermind Client
+  hosts: all
+  become: yes
+  vars:
+    nethermind_home: "{{ ansible_env.HOME | default('/root') }}"
+    nethermind_binary: /usr/local/bin/nethermind/nethermind
+    nethermind_install_dir: /usr/local/bin/nethermind
+    nethermind_service: execution
+    github_api: https://api.github.com/repos/NethermindEth/nethermind/releases/latest
+    version_regex: 'v?([0-9]+\.[0-9]+\.[0-9]+)'
+
+  tasks:
+    - name: Get current Nethermind version
+      command: "{{ nethermind_binary }} --version"
+      register: current_version
+      changed_when: false
+      failed_when: false
+
+    - name: Extract current version number
+      set_fact:
+        current_nethermind_version: "{{ current_version.stdout | regex_search(version_regex, '\\1') | first | default('unknown') }}"
+
+    - name: Query GitHub for latest Nethermind release
+      uri:
+        url: "{{ github_api }}"
+        return_content: yes
+        timeout: 10
+      register: github_response
+      failed_when: false
+
+    - name: Debug - Show all available assets
+      debug:
+        msg: "Available assets: {{ github_response.json.assets | map(attribute='name') | list }}"
+      when: github_response.status == 200
+
+    - name: Extract latest version and download URL
+      set_fact:
+        latest_nethermind_version: "{{ github_response.json.tag_name | regex_replace('^v', '') }}"
+        nethermind_download_url: "{{ github_response.json.assets | selectattr('name', 'match', '.*linux-x64.*\\.zip$') | map(attribute='browser_download_url') | first | default('') }}"
+      when: github_response.status == 200
+
+    - name: Display version comparison
+      debug:
+        msg: |
+          Current version: {{ current_nethermind_version }}
+          Latest version:  {{ latest_nethermind_version }}
+          Download URL:    {{ nethermind_download_url }}
+
+    - name: Skip update if already on latest version
+      debug:
+        msg: "✅ Nethermind is already on the latest version ({{ latest_nethermind_version }})"
+      when: current_nethermind_version == latest_nethermind_version
+
+    - name: Proceed with update
+      block:
+        - name: Stop Nethermind service
+          systemd:
+            name: "{{ nethermind_service }}"
+            state: stopped
+          register: service_stop
+
+        - name: Download latest Nethermind release
+          get_url:
+            url: "{{ nethermind_download_url }}"
+            dest: "{{ nethermind_home }}/nethermind.zip"
+            mode: '0644'
+            timeout: 300
+          register: download_result
+
+        - name: Create temp extraction directory
+          file:
+            path: "{{ nethermind_home }}/nethermind"
+            state: directory
+            mode: '0755'
+
+        - name: Extract Nethermind zip
+          unarchive:
+            src: "{{ nethermind_home }}/nethermind.zip"
+            dest: "{{ nethermind_home }}/nethermind"
+            remote_src: yes
+
+        - name: Remove zip file
+          file:
+            path: "{{ nethermind_home }}/nethermind.zip"
+            state: absent
+
+        - name: Remove old Nethermind installation
+          file:
+            path: "{{ nethermind_install_dir }}"
+            state: absent
+
+        - name: Install Nethermind
+          command: "mv {{ nethermind_home }}/nethermind {{ nethermind_install_dir }}"
+          register: install_result
+
+        - name: Ensure binary has correct permissions
+          file:
+            path: "{{ nethermind_binary }}"
+            mode: '0755'
+            owner: root
+            group: root
+
+        - name: Start Nethermind service
+          systemd:
+            name: "{{ nethermind_service }}"
+            state: started
+          register: service_start
+
+        - name: Verify new version
+          command: "{{ nethermind_binary }} --version"
+          register: new_version
+          changed_when: false
+
+        - name: Display update summary
+          debug:
+            msg: |
+              ✅ Nethermind successfully updated!
+              
+              Old version: {{ current_nethermind_version }}
+              New version: {{ new_version.stdout }}
+              
+              Service status: {{ service_start.state }}
+
+      when: current_nethermind_version != latest_nethermind_version and nethermind_download_url != ''
+
+    - name: Handle missing download URL
+      debug:
+        msg: "❌ Could not find linux-x64 download URL in GitHub releases"
+      when: nethermind_download_url == ''
+
+    - name: Handle API failure
+      debug:
+        msg: "❌ Failed to query GitHub API (status: {{ github_response.status | default('unknown') }})"
+      when: github_response.status != 200

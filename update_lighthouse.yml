@@ -1,0 +1,135 @@
+---
+- name: Update Lighthouse Client
+  hosts: all
+  become: yes
+  vars:
+    lighthouse_home: "{{ ansible_env.HOME | default('/root') }}"
+    lighthouse_binary: /usr/local/bin/lighthouse
+    lighthouse_services:
+      - consensus
+      - validator
+    github_api: https://api.github.com/repos/sigp/lighthouse/releases/latest
+    version_regex: 'v?([0-9]+\.[0-9]+\.[0-9]+)'
+
+  tasks:
+    - name: Get current Lighthouse version
+      command: "{{ lighthouse_binary }} --version"
+      register: current_version
+      changed_when: false
+      failed_when: false
+
+    - name: Extract current version number
+      set_fact:
+        current_lighthouse_version: "{{ current_version.stdout | regex_search(version_regex, '\\1') | first | default('unknown') }}"
+
+    - name: Query GitHub for latest Lighthouse release
+      uri:
+        url: "{{ github_api }}"
+        return_content: yes
+        timeout: 10
+      register: github_response
+      failed_when: false
+
+    - name: Debug - Show all available assets
+      debug:
+        msg: "Available assets: {{ github_response.json.assets | map(attribute='name') | list }}"
+      when: github_response.status == 200
+
+    - name: Extract latest version and download URL
+      set_fact:
+        latest_lighthouse_version: "{{ github_response.json.tag_name | regex_replace('^v', '') }}"
+        lighthouse_download_url: "{{ github_response.json.assets | selectattr('name', 'match', 'lighthouse-v.*-x86_64-unknown-linux-gnu\\.tar\\.gz$') | map(attribute='browser_download_url') | first | default('') }}"
+      when: github_response.status == 200
+
+    - name: Display version comparison
+      debug:
+        msg: |
+          Current version: {{ current_lighthouse_version }}
+          Latest version:  {{ latest_lighthouse_version }}
+          Download URL:    {{ lighthouse_download_url }}
+
+    - name: Skip update if already on latest version
+      debug:
+        msg: "✅ Lighthouse is already on the latest version ({{ latest_lighthouse_version }})"
+      when: current_lighthouse_version == latest_lighthouse_version
+
+    - name: Proceed with update
+      block:
+        - name: Stop Lighthouse services
+          systemd:
+            name: "{{ item }}"
+            state: stopped
+          loop: "{{ lighthouse_services }}"
+          register: services_stop
+
+        - name: Download latest Lighthouse release
+          get_url:
+            url: "{{ lighthouse_download_url }}"
+            dest: "{{ lighthouse_home }}/lighthouse.tar.gz"
+            mode: '0644'
+            timeout: 30
+          register: download_result
+
+        - name: Extract Lighthouse tarball
+          unarchive:
+            src: "{{ lighthouse_home }}/lighthouse.tar.gz"
+            dest: "{{ lighthouse_home }}"
+            remote_src: yes
+
+        - name: Remove tarball
+          file:
+            path: "{{ lighthouse_home }}/lighthouse.tar.gz"
+            state: absent
+
+        - name: Remove old Lighthouse binary
+          file:
+            path: "{{ lighthouse_binary }}"
+            state: absent
+
+        - name: Install Lighthouse binary
+          command: "mv {{ lighthouse_home }}/lighthouse {{ lighthouse_binary }}"
+          register: install_result
+
+        - name: Ensure binary has correct permissions
+          file:
+            path: "{{ lighthouse_binary }}"
+            mode: '0755'
+            owner: root
+            group: root
+
+        - name: Start Lighthouse services
+          systemd:
+            name: "{{ item }}"
+            state: started
+          loop: "{{ lighthouse_services }}"
+          register: services_start
+
+        - name: Verify new version
+          command: "{{ lighthouse_binary }} --version"
+          register: new_version
+          changed_when: false
+
+        - name: Display update summary
+          debug:
+            msg: |
+              ✅ Lighthouse successfully updated!
+              
+              Old version: {{ current_lighthouse_version }}
+              New version: {{ new_version.stdout }}
+              
+              Services started:
+              {% for service in lighthouse_services %}
+              - {{ service }}: {{ services_start.results[loop.index0].state }}
+              {% endfor %}
+
+      when: current_lighthouse_version != latest_lighthouse_version and lighthouse_download_url != ''
+
+    - name: Handle missing download URL
+      debug:
+        msg: "❌ Could not find x86_64-unknown-linux-gnu.tar.gz download URL in GitHub releases"
+      when: lighthouse_download_url == ''
+
+    - name: Handle API failure
+      debug:
+        msg: "❌ Failed to query GitHub API (status: {{ github_response.status | default('unknown') }})"
+      when: github_response.status != 200

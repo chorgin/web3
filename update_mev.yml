@@ -1,0 +1,128 @@
+---
+- name: Update MEV-Boost Client
+  hosts: all
+  become: yes
+  vars:
+    mev_boost_home: "{{ ansible_env.HOME | default('/root') }}"
+    mev_boost_binary: /usr/local/bin/mev-boost
+    mev_boost_service: mevboost
+    github_api: https://api.github.com/repos/flashbots/mev-boost/releases/latest
+    version_regex: 'v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)'
+
+  tasks:
+    - name: Get current MEV-Boost version
+      command: "{{ mev_boost_binary }} --version"
+      register: current_version
+      changed_when: false
+      failed_when: false
+
+    - name: Extract current version number
+      set_fact:
+        current_mev_version: >-
+          {{ (current_version.stdout | regex_search(version_regex, '\1') or ['unknown']) | first }}
+
+    - name: Query GitHub for latest MEV-Boost release
+      uri:
+        url: "{{ github_api }}"
+        return_content: yes
+        timeout: 10
+      register: github_response
+      failed_when: false
+
+    - name: Debug - Show all available assets
+      debug:
+        msg: "Available assets: {{ github_response.json.assets | map(attribute='name') | list }}"
+      when: github_response.status == 200
+
+    - name: Extract latest version and download URL
+      set_fact:
+        latest_mev_version: "{{ github_response.json.tag_name | regex_replace('^v', '') }}"
+        mev_download_url: "{{ github_response.json.assets | selectattr('name', 'match', 'mev-boost.*linux_amd64\\.tar\\.gz$') | map(attribute='browser_download_url') | first | default('') }}"
+      when: github_response.status == 200
+
+    - name: Display version comparison
+      debug:
+        msg: |
+          Current version: {{ current_mev_version }}
+          Latest version:  {{ latest_mev_version }}
+          Download URL:    {{ mev_download_url }}
+
+    - name: Skip update if already on latest version
+      debug:
+        msg: "✅ MEV-Boost is already on the latest version ({{ latest_mev_version }})"
+      when: current_mev_version == latest_mev_version
+
+    - name: Proceed with update
+      block:
+        - name: Stop MEV-Boost service
+          systemd:
+            name: "{{ mev_boost_service }}"
+            state: stopped
+          register: service_stop
+
+        - name: Download latest MEV-Boost release
+          get_url:
+            url: "{{ mev_download_url }}"
+            dest: "{{ mev_boost_home }}/mev-boost.tar.gz"
+            mode: '0644'
+            timeout: 30
+          register: download_result
+
+        - name: Extract MEV-Boost tarball
+          unarchive:
+            src: "{{ mev_boost_home }}/mev-boost.tar.gz"
+            dest: "{{ mev_boost_home }}"
+            remote_src: yes
+
+        - name: Remove unnecessary files
+          file:
+            path: "{{ mev_boost_home }}/{{ item }}"
+            state: absent
+          loop:
+            - mev-boost.tar.gz
+            - LICENSE
+            - README.md
+
+        - name: Install MEV-Boost binary
+          command: "mv {{ mev_boost_home }}/mev-boost {{ mev_boost_binary }}"
+          register: install_result
+
+        - name: Ensure binary has correct permissions
+          file:
+            path: "{{ mev_boost_binary }}"
+            mode: '0755'
+            owner: root
+            group: root
+
+        - name: Start MEV-Boost service
+          systemd:
+            name: "{{ mev_boost_service }}"
+            state: started
+          register: service_start
+
+        - name: Verify new version
+          command: "{{ mev_boost_binary }} --version"
+          register: new_version
+          changed_when: false
+
+        - name: Display update summary
+          debug:
+            msg: |
+              ✅ MEV-Boost successfully updated!
+
+              Old version: {{ current_mev_version }}
+              New version: {{ new_version.stdout }}
+
+              Service status: {{ service_start.state }}
+
+      when: current_mev_version != latest_mev_version and mev_download_url != ''
+
+    - name: Handle missing download URL
+      debug:
+        msg: "❌ Could not find linux_amd64.tar.gz download URL in GitHub releases"
+      when: mev_download_url == ''
+
+    - name: Handle API failure
+      debug:
+        msg: "❌ Failed to query GitHub API (status: {{ github_response.status | default('unknown') }})"
+      when: github_response.status != 200

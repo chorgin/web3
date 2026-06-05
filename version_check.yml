@@ -1,0 +1,82 @@
+---
+- name: Check Ethereum Client Versions
+  hosts: all
+  gather_facts: no
+  vars:
+    programs:
+      - name: Lighthouse
+        binary: /usr/local/bin/lighthouse
+        github_api: https://api.github.com/repos/sigp/lighthouse/releases/latest
+        version_regex: 'v?([0-9]+\.[0-9]+\.[0-9]+)'
+      - name: Nethermind
+        binary: /usr/local/bin/nethermind/nethermind
+        github_api: https://api.github.com/repos/NethermindEth/nethermind/releases/latest
+        version_regex: 'v?([0-9]+\.[0-9]+\.[0-9]+)'
+      - name: mev-boost
+        binary: /usr/local/bin/mev-boost
+        github_api: https://api.github.com/repos/flashbots/mev-boost/releases/latest
+        version_regex: 'v?([0-9]+\.[0-9]+(?:\.[0-9]+)?)'
+
+  tasks:
+    - name: Initialize results list
+      set_fact:
+        version_results: []
+
+    - name: Get current installed versions
+      shell: "{{ item.binary }} --version 2>&1 || echo 'Not installed'"
+      register: current_versions
+      changed_when: false
+      failed_when: false
+      loop: "{{ programs }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Query GitHub APIs for latest releases
+      uri:
+        url: "{{ item.github_api }}"
+        return_content: yes
+        timeout: 10
+      register: github_responses
+      failed_when: false
+      loop: "{{ programs }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Build version results
+      set_fact:
+        version_results: "{{ version_results + [result_item] }}"
+      vars:
+        current_raw: "{{ current_versions.results[idx].stdout }}"
+        current_match: "{{ current_raw | regex_search(item.version_regex, '\\1') }}"
+        current_version: "{{ current_match[0] if current_match else 'unknown' }}"
+        latest_raw: "{{ github_responses.results[idx].json.tag_name | default('unknown') if github_responses.results[idx].status == 200 else 'unknown' }}"
+        latest_version: "{{ latest_raw | regex_replace('^v', '') }}"
+        needs_update: "{{ current_version != latest_version and current_version != 'unknown' and latest_version != 'unknown' }}"
+        result_item:
+          name: "{{ item.name }}"
+          current: "{{ current_version }}"
+          latest: "{{ latest_version }}"
+          status: "{{ '⏫️' if needs_update else '✅' }}"
+          needs_update: "{{ needs_update }}"
+      loop: "{{ programs }}"
+      loop_control:
+        index_var: idx
+        label: "{{ item.name }}"
+
+    - name: "============================= 📊 VERSION CHECK SUMMARY ============================="
+      debug:
+        msg: |
+          {{ item.status }}  {{ item.name }}{% if item.needs_update %} | ⚠️  UPDATE AVAILABLE!{% endif %}
+
+              Installed : {{ item.current }}
+              Latest    : {{ item.latest }}
+      loop: "{{ version_results }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: "===================================================================================="
+      debug:
+        msg: >-
+          {{ version_results | selectattr('needs_update', 'equalto', true) | list | length }} update(s) available,
+          {{ version_results | selectattr('needs_update', 'equalto', false) | list | length }} up to date
+          | 💡 Managed via Semaphore
