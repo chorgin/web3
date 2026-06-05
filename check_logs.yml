@@ -1,0 +1,110 @@
+---
+- name: Service Health Check
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    log_lines: 500
+    consensus_unit: consensus
+    execution_unit: execution
+    validator_unit: validator
+    mevboost_unit: mevboost
+    consensus_keywords:
+      - "New block received"
+      - "Synced"
+    execution_keywords:
+      - "Synced Chain Head"
+      - "Finalized"
+    validator_keywords:
+      - "All validators active"
+      - "Successfully published attestations"
+    mevboost_keywords:
+      - "127.0.0.1:18550"
+      - "listening"
+  tasks:
+    - name: "consensus | check: {{ item }}"
+      ansible.builtin.shell: journalctl -u {{ consensus_unit }} -n {{ log_lines }} --no-pager --output=cat | grep -qi "{{ item }}" && echo FOUND || echo NOT_FOUND
+      register: consensus_checks
+      loop: "{{ consensus_keywords }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      failed_when: false
+    - name: set consensus health
+      ansible.builtin.set_fact:
+        consensus_ok: "{{ consensus_checks.results | map(attribute='stdout') | select('search', 'NOT_FOUND') | list | length == 0 }}"
+    - name: "execution | check: {{ item }}"
+      ansible.builtin.shell: journalctl -u {{ execution_unit }} -n {{ log_lines }} --no-pager --output=cat | grep -qi "{{ item }}" && echo FOUND || echo NOT_FOUND
+      register: execution_checks
+      loop: "{{ execution_keywords }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      failed_when: false
+    - name: set execution health
+      ansible.builtin.set_fact:
+        execution_ok: "{{ execution_checks.results | map(attribute='stdout') | select('search', 'NOT_FOUND') | list | length == 0 }}"
+    - name: "validator | check: {{ item }}"
+      ansible.builtin.shell: journalctl -u {{ validator_unit }} -n {{ log_lines }} --no-pager --output=cat | grep -qi "{{ item }}" && echo FOUND || echo NOT_FOUND
+      register: validator_checks
+      loop: "{{ validator_keywords }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      failed_when: false
+    - name: set validator health
+      ansible.builtin.set_fact:
+        validator_ok: "{{ validator_checks.results | map(attribute='stdout') | select('search', 'NOT_FOUND') | list | length == 0 }}"
+    - name: "mevboost | check: {{ item }}"
+      ansible.builtin.shell: journalctl -u {{ mevboost_unit }} -n {{ log_lines }} --no-pager --output=cat | grep -qi "{{ item }}" && echo FOUND || echo NOT_FOUND
+      register: mevboost_checks
+      loop: "{{ mevboost_keywords }}"
+      loop_control:
+        label: "{{ item }}"
+      changed_when: false
+      failed_when: false
+    - name: set mevboost health
+      ansible.builtin.set_fact:
+        mevboost_ok: "{{ mevboost_checks.results | map(attribute='stdout') | select('search', 'NOT_FOUND') | list | length == 0 }}"
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "================================================="
+          - "        SERVICE HEALTH CHECK SUMMARY"
+          - "================================================="
+          - "  {% if consensus_ok | bool %}✅{% else %}❌{% endif %}  consensus  | {{ consensus_keywords | join(', ') }}"
+          - "  {% if execution_ok | bool %}✅{% else %}❌{% endif %}  execution  | {{ execution_keywords | join(', ') }}"
+          - "  {% if validator_ok | bool %}✅{% else %}❌{% endif %}  validator  | {{ validator_keywords | join(', ') }}"
+          - "  {% if mevboost_ok | bool %}✅{% else %}❌{% endif %}  mevboost   | {{ mevboost_keywords | join(', ') }}"
+          - "================================================="
+          - "  {% if (consensus_ok|bool) and (execution_ok|bool) and (validator_ok|bool) and (mevboost_ok|bool) %}🟢 ALL SERVICES HEALTHY{% else %}🔴 ONE OR MORE SERVICES NEED ATTENTION{% endif %}"
+          - "  Searched last {{ log_lines }} lines per service."
+          - "================================================="
+    - name: "consensus | detail"
+      ansible.builtin.debug:
+        msg: "  {% if item.0.stdout == 'FOUND' %}✅{% else %}❌{% endif %}  {{ item.1 }}"
+      loop: "{{ consensus_checks.results | zip(consensus_keywords) | list }}"
+      loop_control:
+        label: "{{ item.1 }}"
+      when: not (consensus_ok | bool)
+    - name: "execution | detail"
+      ansible.builtin.debug:
+        msg: "  {% if item.0.stdout == 'FOUND' %}✅{% else %}❌{% endif %}  {{ item.1 }}"
+      loop: "{{ execution_checks.results | zip(execution_keywords) | list }}"
+      loop_control:
+        label: "{{ item.1 }}"
+      when: not (execution_ok | bool)
+    - name: "validator | detail"
+      ansible.builtin.debug:
+        msg: "  {% if item.0.stdout == 'FOUND' %}✅{% else %}❌{% endif %}  {{ item.1 }}"
+      loop: "{{ validator_checks.results | zip(validator_keywords) | list }}"
+      loop_control:
+        label: "{{ item.1 }}"
+      when: not (validator_ok | bool)
+    - name: "mevboost | detail"
+      ansible.builtin.debug:
+        msg: "  {% if item.0.stdout == 'FOUND' %}✅{% else %}❌{% endif %}  {{ item.1 }}"
+      loop: "{{ mevboost_checks.results | zip(mevboost_keywords) | list }}"
+      loop_control:
+        label: "{{ item.1 }}"
+      when: not (mevboost_ok | bool)
